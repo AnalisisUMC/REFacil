@@ -1,0 +1,420 @@
+---
+title: "DOI a Bibtex - búsqueda en CrossRef y OpenAlex (Reffy)"
+author: ""
+date: ""
+output: 
+  flexdashboard::flex_dashboard:
+    orientation: rows
+    vertical_layout: fill
+    logo: "logo umc2.png"
+    theme: cerulean
+runtime: shiny
+---
+
+```{r setup, include=FALSE}
+#rm(list=ls())
+
+knitr::opts_chunk$set(echo=FALSE, message=FALSE, warning=FALSE)
+
+library(shiny)
+library(shinyjs)
+useShinyjs()
+
+# CSS styling inside setup chunk
+tags$head(tags$style(HTML("
+  .navbar { min-height: 5px !important; }
+  .navbar-brand { padding: 2px !important; }
+  .alert-warning { 
+    color: #856404; 
+    background-color: #fff3cd; 
+    border-color: #ffeeba; 
+    padding: 10px; 
+    margin-bottom: 15px;
+  }
+  .alert-danger { 
+    color: #721c24; 
+    background-color: #f8d7da; 
+    border-color: #f5c6cb; 
+    padding: 10px; 
+    margin-bottom: 15px;
+  }
+  .form-group { margin-bottom: 15px; }
+  .btn-primary { width: 100%; }
+  #bibtex_output {
+    white-space: pre-wrap;
+    background-color: #f8f9fa;
+    padding: 15px;
+    border-radius: 4px;
+    border: 1px solid #dee2e6;
+    min-height: 200px;
+  }
+")))
+
+```
+
+
+```{r libraries, include=FALSE}
+
+library(flexdashboard)
+
+library(tidyverse)
+library(readxl)
+library(here)
+library(DT)
+library(bibtex)
+
+library(jsonlite)
+library(rcrossref)
+library(openalexR)
+library(stringr)
+
+library(tinytex)
+library(magick)
+
+#cargar excepciones de excel
+excepciones <- rio::import("excepciones.xlsx")
+excepciones_all <- na.omit(unlist(excepciones))
+excepciones_all <- unique(excepciones_all)
+#excepciones_all <- replace(excepciones_all, excepciones_all=="Uro"," Uro ")
+#excepciones_all <- replace(excepciones_all, excepciones_all=="Ica"," Ica ")
+
+```
+
+
+```{r funciones bibliotásticas}
+
+
+formato_pags <- function(page = NA, first_page = NA, last_page = NA) {
+  # Usar pages, pero reemplazar - por --
+  if (!is.na(page)) {
+    return(gsub("-", "--", page))  
+  }
+  
+  # Cuando no hay, combinar first page y last page unidas por --
+  if (!is.na(first_page) & !is.na(last_page)) {
+    return(paste(first_page, last_page, sep = "--"))
+  }
+  
+  # NA si no hay nada
+  NA_character_
+}
+
+
+#convertir títulos a capitalización APA en castellano
+titulo_apa7_es <- function(title, excepciones) {
+  if (is.na(title)) return(NA_character_)
+  
+  # Create a named vector for case-insensitive matching
+  exception_map <- setNames(excepciones, tolower(excepciones))
+  
+  title_processed <- title %>%
+    # Stage 1: Convert entire title to lowercase
+    str_to_lower() %>%
+    
+    # Stage 2: Replace EXACT matches of lowercase exceptions
+    str_replace_all(
+      regex(
+        paste0("\\b(", paste(tolower(excepciones), collapse = "|"), ")\\b"),
+        ignore_case = FALSE
+      ),
+      function(match) exception_map[[match]]
+    ) %>%
+    
+    # Stage 3: Apply APA capitalization rules
+    # Capitalize first letter
+    str_replace(
+      "^(\\s*[¡¿]?)([a-z])", 
+      function(m) paste0(str_sub(m, 1, -2), toupper(str_sub(m, -1)))
+    ) %>%
+    
+    # Capitalize after punctuation
+    str_replace_all(
+      "([.!?¡¿])(\\s*)([a-z])", 
+      function(m) paste0(str_sub(m, 1, -2), toupper(str_sub(m, -1)))
+    )
+  
+  return(title_processed)
+}
+
+
+#quitar part inicial del link del DOI
+clean_doi <- function(doi_url) {
+  #convertir input a string por si no lo esta
+  doi_url <- as.character(doi_url)
+  
+  # localizar el primer "10."
+  first_10_pos <- str_locate(doi_url, "10\\.")[1, "start"]
+  
+  if (is.na(first_10_pos)) {
+    return(NA_character_)  # NA si no hay "10."
+  }
+  
+  # nos quedamos con todo lo que esta a partir del primer "10."
+  str_sub(doi_url, start = first_10_pos)
+}
+
+
+# Función para normalizar guiones
+normalizar_guiones <- function(texto) {
+  texto %>% 
+    str_replace_all("[‐‑–—−]", "-") %>%  # Reemplazar todos los tipos de guión
+    str_replace_all("‐", "-")             # Caso especial para guión Unicode U+2010
+}
+
+
+
+```
+
+
+```{r funciones para obtener ref y convertir a bibtex}
+
+#Obtener referencia de CrossRef u OpenAlex
+get_reference <- function(doi) {
+  # limpiar doi
+  clean_doi <- clean_doi(doi)
+  
+  # probar CrossRef primero
+  cr_data <- tryCatch({
+    cr_result <- rcrossref::cr_works(dois = clean_doi)$data
+    if (nrow(cr_result) > 0) {
+      # revisar si referencia es artículo
+      if (!is.null(cr_result$type) && tolower(cr_result$type[1]) == "journal-article") {
+        cr_result %>%
+          mutate(
+            year = substr(issued, 1, 4),
+            authors = map_chr(author, ~paste(.x$given, .x$family, collapse = " AND ")),
+            page = formato_pags(page = page),
+            volume = na_if(volume, ""),
+            number = na_if(issue, ""),
+            journal = na_if(container.title, ""),
+            doi = clean_doi(doi)
+          ) %>%
+          select(authors, year, title, journal, volume, number, page, doi)
+      } else {
+        message("DOI en Crossref pero no es artículo de journal (type: ", cr_result$type[1], ")")
+        NULL
+      }
+    } else NULL
+  }, error = function(e) NULL)
+  
+  # buscar en OpenAlex si falla CrossRef o no es artículo
+  if (is.null(cr_data)) {
+    oa_data <- tryCatch({
+      oa_result <- openalexR::oa_fetch(doi = clean_doi)
+      if (nrow(oa_result) > 0) {
+        # Check if type is article
+        if (!is.null(oa_result$type) && tolower(oa_result$type[1]) == "article") {
+          oa_result %>%
+            mutate(
+              authors = map_chr(authorships, ~paste(.x$display_name, collapse = " AND ")),
+              page = formato_pags(first_page = first_page, last_page = last_page),
+              volume = na_if(volume, ""),
+              number = na_if(issue, ""),
+              journal = na_if(source_display_name, ""),
+              doi = clean_doi(doi)
+            ) %>%
+            select(authors, year = publication_year, title, journal, volume, number, page, doi)
+        } else {
+          message("DOI en OpenAlex pero no es artículo de journal (type: ", oa_result$type[1], ")")
+          NULL
+        }
+      } else NULL
+    }, error = function(e) NULL)
+  } else {
+    oa_data <- NULL
+  }
+  
+  # devolver la que funcione prefiriendo CrossRef
+  if (!is.null(cr_data)) {
+    cr_data
+  } else if (!is.null(oa_data)) {
+    oa_data
+  } else {
+    message("No se encontró un artículo de journal para este DOI")
+    NULL
+  }
+}
+
+#Hacer el bibtex
+generate_bibtex <- function(data) {
+  # revisar si el get_reference es nulo
+  if (is.null(data) || nrow(data) == 0) {
+    return("Error: No hay datos de referencia")
+  }
+  
+  # Normalizar autores y título ANTES del formateo APA
+  data$authors <- normalizar_guiones(data$authors)
+  data$title <- normalizar_guiones(data$title)
+  
+  # titulo en APA 7 castellano
+  formatted_title <- titulo_apa7_es(data$title, excepciones_all)
+  
+  #Crear article key
+  # Obtener apellido del primer autor (antes del primer "AND")
+  first_author_lastname <- str_split(data$authors, " AND ")[[1]][1] %>% #extraer todo antes del 1er AND
+    str_trim() %>%  # quitar espacios
+    str_extract("([^ ]+)$") %>%  # extraer ultima palabra
+    tolower()
+  
+  year <- data$year
+  
+  # Extraer primera palabra del título (no puntuaciones, cualquier letra unicode)
+  first_title_word <- str_extract(formatted_title, "\\p{L}+") %>% 
+    tolower() %>% 
+    str_replace_all("[^\\p{L}]", "")
+  
+  # armar el article key
+  citation_key <- paste(first_author_lastname, year, first_title_word, sep = "_")
+  
+  # Create BibTeX entry
+  bib_entry <- sprintf("@article{%s,
+  author = {%s},
+  title = {{%s}},
+  journal = {{%s}},
+  year = {%s},
+  volume = {%s},
+  number = {%s},
+  pages = {%s},
+  doi = {%s}
+}",
+                       citation_key,
+                       data$authors,
+                       formatted_title,
+                       data$journal %||% "",
+                       year,
+                       data$volume %||% "",
+                       data$number %||% "",
+                       data$page %||% "",
+                       data$doi
+  )
+  
+  return(bib_entry)
+}
+
+```
+
+
+```{r funcion mensajes shiny}
+
+# Define your get_reference and generate_bibtex functions here
+# (Include all your helper functions that were previously in your app)
+
+# Helper function to capture messages
+capture_messages <- function(expr) {
+  messages <- character(0)
+  withCallingHandlers(
+    expr,
+    message = function(m) {
+      messages <<- c(messages, m$message)
+      invokeRestart("muffleMessage")
+    }
+  )
+  messages
+}
+
+```
+
+
+```{r input-panel}
+
+div(
+  class = "well",
+  style = "margin-bottom: 20px;",
+  textInput("doi_input", "Pon tu DOI aqui:", 
+            placeholder = "p. ej., https://doi.org/10.xxxx/xxxxxx",
+            width = "100%"),
+  actionButton("convert_btn", "Convertir a BibTeX", 
+               class = "btn-primary")
+)
+
+```
+
+
+```{r output container}
+# Main output container
+div(
+  uiOutput("status_messages"),
+  verbatimTextOutput("bibtex_output"),
+  uiOutput("copy_button_ui")
+)
+```
+
+
+```{r guardar y mostrar bibtex reactivamente}
+
+# Store BibTeX data reactively
+bibtex_data <- reactiveVal(NULL)
+
+observeEvent(input$convert_btn, {
+  req(input$doi_input)
+  
+  # Clear previous outputs
+  bibtex_data(NULL)
+  output$status_messages <- renderUI({NULL})
+  output$bibtex_output <- renderPrint({NULL})
+  output$copy_button_ui <- renderUI({NULL})
+  
+  showNotification("Buscando DOI...", duration = NULL, id = "loading")
+  
+  tryCatch({
+    # Capture messages
+    messages <- capture_messages({
+      ref_data <- get_reference(input$doi_input)
+    })
+    
+    if (!is.null(ref_data)) {
+      bibtex <- generate_bibtex(ref_data)
+      bibtex_data(bibtex)
+      
+      output$bibtex_output <- renderPrint({
+        cat(bibtex)
+      })
+      
+      output$copy_button_ui <- renderUI({
+        actionButton("copy_btn", icon("copy"), 
+                    style = "margin-top: 10px;",
+                    title = "Copiar bibtex al portapapeles")
+      })
+    }
+    
+    # Show messages if any
+    if (length(messages) > 0 || is.null(ref_data)) {
+      output$status_messages <- renderUI({
+        div(class = ifelse(is.null(ref_data), "alert alert-danger", "alert alert-warning"),
+            strong(ifelse(is.null(ref_data), "Error:", "Nota:")), 
+            br(),
+            if (is.null(ref_data) && length(messages) == 0) {
+              "No se encontró un artículo para este DOI"
+            } else {
+              paste(unique(messages), collapse = "\n")
+            }
+        )
+      })
+    }
+    
+  }, error = function(e) {
+    output$status_messages <- renderUI({
+      div(class = "alert alert-danger",
+          "Error:", e$message)
+    })
+  }, finally = {
+    removeNotification("loading")
+  })
+})
+
+# Copy to clipboard functionality
+observeEvent(input$copy_btn, {
+  if (!is.null(bibtex_data())) {
+    copy_text <- bibtex_data()
+    writeClipboard(copy_text)
+    showNotification("¡Copiado al portapapeles!", type = "message", duration = 2)
+  } else {
+    showNotification("Nada para copiar", type = "warning", duration = 2)
+  }
+})
+
+```
+
+
+
+
