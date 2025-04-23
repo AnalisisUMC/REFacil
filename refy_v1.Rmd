@@ -1,0 +1,136 @@
+---
+title: "Buscador de referencias para Overleaf - REFacil (Reffy)"
+author: ""
+date: ""
+output: 
+  flexdashboard::flex_dashboard:
+    orientation: rows
+    vertical_layout: fill
+    logo: "02 Logos/umc2.jpg"
+    css: "www/estilo.css"
+runtime: shiny
+---
+
+```{r message=FALSE, warning=FALSE}
+
+library(foreign)
+library(haven)
+library(openxlsx)
+library(readxl)
+library(tidyverse)
+library(ggplot2)
+library(fst)
+library(ggpubr)
+library(flexdashboard)
+library(shiny)
+library(DT)
+library(stringr)
+
+```
+
+```{r Bases de datos}
+
+tabla_1 <- read.xlsx("01 Bases/bd_referencias.xlsx")
+
+```
+
+```{r}
+
+marc_autores <- tabla_1 %>% 
+  select(autores) %>% 
+  separate(autores, into = paste0("autor_", 1:20), sep = ";", fill = "right", extra = "drop") %>% 
+  mutate(id = row_number()) %>% 
+  pivot_longer(cols = starts_with("autor_"), names_to = "columna_origen", values_to = "autor") %>%
+  filter(!is.na(autor)) %>%
+  mutate(autor = str_trim(autor)) %>%
+  select(autor) %>% 
+  unique() %>% 
+  pull()
+
+```
+
+```{r}
+
+tabsetPanel(id = "mainPanel",
+            
+            tabPanel("Criterios de búsqueda", 
+                     # Botón de búsqueda por nombre de autor
+                     selectInput("var1",
+                                 "Selecciona el autor:",
+                                 choices = c("Escribe el nombre el autor",marc_autores)),
+                     # choices = unique(str_split(tab2$Marcador,"; ") %>%  unlist())),
+                     actionButton("buscar",
+                                  "Buscar"),
+                     dataTableOutput("text")
+            ),
+            
+            tabPanel("Resultados",
+                     
+                     tags$head(
+                       tags$script(src = "https://cdnjs.cloudflare.com/ajax/libs/clipboard.js/2.0.6/clipboard.min.js"),
+                       tags$script(HTML("
+                       $(document).ready(function() {
+                       new ClipboardJS('.btn-copy');
+                       });
+                       "
+                       )
+                       )
+                     ),
+                     
+  renderDT({
+    
+    tabla_1 %>%
+  filter(grepl(input$var1, autores, fixed = TRUE)) %>% 
+  # Guarda el contenido original en una nueva variable para el copiado
+  mutate(overleaf_plain = overleaf) %>% 
+  # Convierte los saltos de línea a <br> para la visualización
+  mutate(overleaf = gsub("\n", "<br>", overleaf)) %>% 
+  # Concatena el HTML para mostrar y el botón, utilizando la versión limpia para copiar
+  mutate(overleaf = paste0(
+    '<div style="position: relative; padding-top: 5px; padding-right: 5px;">',
+      '<div style="padding-right: 80px;">', overleaf, '</div>',
+      '<button class="btn btn-sm btn-secondary btn-copy" ',
+             'data-clipboard-text="', overleaf_plain, '" ',
+             'style="position: absolute; top: 0; right: 0; margin: 2px;">Copiar</button>',
+    '</div>'
+  )) %>% 
+  select(
+    Autores = autores,
+    Título = titulo,
+    `doi/url` = doi_url,
+    `Overleaf/LaTeX` = overleaf
+  ) %>% 
+  datatable(
+    filter = "top",
+    escape = FALSE,  # permite que se renderice el HTML
+    options = list(
+      dom = 'Brtip',
+      paging = TRUE,
+      pageLength = 100,
+      scrollY = "660px",
+      fixedColumns = TRUE,
+      fixedHeader = TRUE,
+      columnDefs = list(
+        list(targets = 1, width = '150px'),
+        list(targets = 2, width = '400px'),
+        list(targets = 3, width = '150px'),
+        list(targets = 4, width = '750px'),
+        list(targets = 0, visible = FALSE)
+      )
+    ),
+    selection = 'none',
+    class = 'stripe hover'
+  )
+  }
+  )
+            )
+  
+)
+
+# Observador del botón
+observeEvent(input$buscar, {
+  updateTabsetPanel(session, "mainPanel", selected = "Resultados")
+})
+
+```
+
